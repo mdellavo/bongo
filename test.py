@@ -1,20 +1,27 @@
 import pprint
+import datetime
 
-from bongo.engine import Bongo
+from bongo.engine import json_file
 
-db = Bongo.json_file("testdb")
+db = json_file("testdb")
 db.create_database()
 
 db.create_collection("foo")
+print db.get_collections()
 
-doc = {"foo": "bar", "baz": [1,2,3]}
+doc = {
+    "foo": True,
+    "bar": datetime.datetime.utcnow(),
+    "baz": [1, 2, 3]
+}
 
-doc_id = db.save("foo", doc)
+Foo = db.get_collection("foo")
+
+doc_id = Foo.save(doc)
 print doc_id
 
-doc = db.load("foo", doc_id)
+doc = Foo.load(doc_id)
 pprint.pprint(doc)
 
-docs = db.find("foo")
+docs = Foo.find()
 pprint.pprint(list(docs))
-

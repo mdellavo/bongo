@@ -3,28 +3,64 @@ import json
 import uuid
 import glob
 import logging
+import collections
+import datetime
 
 log = logging.getLogger(__name__)
 
-FSYNC = True
 PK = "_id"
 DOCUMENT_PREFIX = "doc"
 DOCUMENT_EXTENSION = "json"
 
 
-class Encoder(object):
-    def encode(self, document):
+# FIXME uuid4 is terrible, an objectid would be better
+class DocumentId(object):
+    def __init__(self, value=None):
+        self.value = value or uuid.uuid4().hex
+
+    def __str__(self):
+        return str(self.value)
+
+    def __repr__(self):
+        return "<DocumentId({})>".format(self)
+
+DEFAULT_ENCODERS = [
+    (DocumentId, lambda o: str(o)),
+    ((datetime.date, datetime.datetime), lambda o: o.isoformat(" "))
+]
+
+
+class JsonEncoder(json.JSONEncoder):
+    def __init__(self, *args, **kwargs):
+        super(JsonEncoder, self).__init__(*args, **kwargs)
+        self.encoders = []
+        self.encoders.extend(DEFAULT_ENCODERS)
+
+    def add_encoder(self, cls, func):
+        self.encoders.append((cls, func))
+
+    def default(self, o):
+        for cls, func in self.encoders:
+            if isinstance(o, cls):
+                return func(o)
+
+
+class Serializer(object):
+    def serialize(self, document):
         raise NotImplemented()
 
-    def decode(self, data):
+    def deserialize(self, data):
         raise NotImplemented()
 
 
-class JsonEncoder(Encoder):
-    def encode(self, document):
-        return json.dumps(document, indent=4)
+class JsonSerializer(Serializer):
+    def __init__(self, encoder=None):
+        self.encoder = encoder or JsonEncoder
 
-    def decode(self, data):
+    def serialize(self, document):
+        return json.dumps(document, sort_keys=True, indent=4, cls=self.encoder)
+
+    def deserialize(self, data):
         return json.loads(data)
 
 
@@ -46,6 +82,9 @@ class Storage(object):
     def create_collection(self, collection):
         raise NotImplemented()
 
+    def get_collections(self):
+        raise NotImplemented()
+
     def store_document(self, collection, document_id, document):
         raise NotImplemented()
 
@@ -57,9 +96,9 @@ class Storage(object):
 
 
 class FileStorage(Storage):
-    def __init__(self, path, encoder):
+    def __init__(self, path, serializer):
         self.path = path
-        self.encoder = encoder
+        self.serializer = serializer
 
     def get_database_path(self):
         return self.path
@@ -90,19 +129,23 @@ class FileStorage(Storage):
         if not os.path.exists(collection_path):
             os.makedirs(collection_path)
 
+    def get_collections(self):
+        db_path = self.get_database_path()
+        dirs = [e for e in os.listdir(db_path) if os.path.isdir(self.get_collection_path(e))]
+        return sorted(dirs)
+
     def store_document(self, collection, document_id, document):
         doc_path = self.get_document_path(collection, document_id)
         tmp_path = doc_path + ".tmp"
         with open(tmp_path, "w") as f:
-            f.write(self.encoder.encode(document))
+            f.write(self.serializer.serialize(document))
             f.flush()
-            if FSYNC:
-                os.fsync(f.fileno())
+            os.fsync(f.fileno())
         os.rename(tmp_path, doc_path)
 
     def load_by_path(self, path):
         with open(path) as f:
-            return self.encoder.decode(f.read())
+            return self.serializer.deserialize(f.read())
 
     def load_document(self, collection, document_id):
         doc_path = self.get_document_path(collection, document_id)
@@ -114,21 +157,47 @@ class FileStorage(Storage):
             yield self.load_by_path(path)
 
 
-class DocumentId(object):
-    def __init__(self, value=None):
-        self.value = value or uuid.uuid4().hex
+class Index(object):
+    def __init__(self):
+        self.index = collections.defaultdict(list)
 
-    def __str__(self):
-        return str(self.value)
+    def get_key(self, document):
+        pass
+
+    def add_documment(self, document):
+        self.index[self.get_key(document)] = document[PK]
+
+
+class Collection(object):
+    def __init__(self, storage, collection):
+        self.storage = storage
+        self.name = collection
+
+    def __repr__(self):
+        return "<Collection(name={})>".format(self.name)
+
+    def get_name(self):
+        return self.name
+
+    def save(self, document):
+        document_id = document.get("_id")
+        if not document_id:
+            document_id = DocumentId()
+            document[PK] = document_id
+
+        self.storage.store_document(self.name, document_id, document)
+        return document_id
+
+    def load(self, document_id):
+        return self.storage.load_document(self.name, document_id)
+
+    def find(self):
+        return Cursor(self.storage.documents_iter(self.name))
 
 
 class Bongo(object):
     def __init__(self, storage):
         self.storage = storage
-
-    @classmethod
-    def json_file(cls, path):
-        return cls(FileStorage(path, JsonEncoder()))
 
     def create_database(self):
         self.storage.create_database()
@@ -136,18 +205,14 @@ class Bongo(object):
     def create_collection(self, collection):
         self.storage.create_collection(collection)
 
-    def save(self, collection, document):
-        document_id = document.get("_id")
-        if not document_id:
-            document_id = str(DocumentId())
-            document[PK] = document_id
+    def get_collections(self):
+        return [Collection(self.storage, name) for name in self.storage.get_collections()]
 
-        self.storage.store_document(collection, document_id, document)
+    def get_collection(self, name):
+        for collection in self.get_collections():
+            if collection.get_name() == name:
+                return collection
 
-        return document_id
 
-    def load(self, collection, document_id):
-        return self.storage.load_document(collection, document_id)
-
-    def find(self, collection, filter=None):
-        return Cursor(self.storage.documents_iter(collection))
+def json_file(path):
+    return Bongo(FileStorage(path, JsonSerializer()))
